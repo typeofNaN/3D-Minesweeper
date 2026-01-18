@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>3D扫雷游戏</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+    body {
+      font-family: 'Arial', sans-serif;
+      overflow: hidden;
+      background: #1a1a1a;
+    }
+    #app {
+      width: 100vw;
+      height: 100vh;
+    }
+    #ui {
+      position: absolute;
+      top: 20px;
+      left: 20px;
+      color: white;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 15px;
+      border-radius: 8px;
+      z-index: 100;
+    }
+    #ui h1 {
+      font-size: 24px;
+      margin-bottom: 10px;
+    }
+    #ui div {
+      margin: 5px 0;
+    }
+    button {
+      background: #4CAF50;
+      color: white;
+      border: none;
+      padding: 10px 20px;
+      margin: 5px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:hover {
+      background: #45a049;
+    }
+    #instructions {
+      position: absolute;
+      bottom: 20px;
+      left: 20px;
+      color: white;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 15px;
+      border-radius: 8px;
+      z-index: 100;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <div id="ui">
+    <h1>3D扫雷</h1>
+    <div>地雷数量: <span id="mine-count">0</span></div>
+    <div>已标记: <span id="flagged-count">0</span></div>
+    <div>状态: <span id="game-status">游戏中</span></div>
+    <button id="reset-btn">重新开始</button>
+  </div>
+  <div id="instructions">
+    <div>操作说明：</div>
+    <div>• 左键点击：揭开格子</div>
+    <div>• 右键点击：标记/取消标记地雷</div>
+    <div>• 滚轮：缩放视角</div>
+    <div>• 按住左键拖动：旋转球体</div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
+
