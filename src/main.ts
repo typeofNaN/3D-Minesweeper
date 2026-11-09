@@ -1,424 +1,455 @@
-import * as THREE from 'three';
-import { SphereGrid } from './utils/SphereGrid';
-import { MinesweeperGame, CellState } from './game/MinesweeperGame';
-import { CameraControls } from './controls/CameraControls';
+import * as THREE from 'three'
+import { CameraControls } from './controls/CameraControls'
+import { DIFFICULTY_BY_ID, type DifficultyId } from './game/difficulties'
+import {
+  CellState,
+  GameStatus,
+  MinesweeperGame,
+  type GameActionResult
+} from './game/MinesweeperGame'
+import { SphereGrid, type SphereCell } from './utils/SphereGrid'
 
-class GameApp {
-  private scene: THREE.Scene;
-  private camera: THREE.PerspectiveCamera;
-  private renderer: THREE.WebGLRenderer;
-  private sphereGrid: SphereGrid;
-  private game: MinesweeperGame | null = null;
-  private cameraControls: CameraControls;
-  private raycaster: THREE.Raycaster;
-  private mouse: THREE.Vector2;
-  private hexGroup: THREE.Group | null = null;
+const NUMBER_COLORS = ['#dbe8ec', '#0b8ca5', '#1b6da8', '#5b55a5', '#a05083', '#b9543d', '#b33b32']
+
+class OrbitalSweepApp {
+  private readonly scene = new THREE.Scene()
+  private readonly camera = new THREE.PerspectiveCamera(42, innerWidth / innerHeight, 0.1, 100)
+  private readonly renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true })
+  private readonly globe = new THREE.Group()
+  private readonly raycaster = new THREE.Raycaster()
+  private readonly pointer = new THREE.Vector2()
+  private readonly cellMeshes = new Map<number, THREE.Mesh>()
+  private readonly markers = new Map<number, THREE.Sprite>()
+  private readonly materials = {
+    hidden: new THREE.MeshStandardMaterial({
+      color: 0x24384b,
+      roughness: 0.76,
+      metalness: 0.18,
+      flatShading: true
+    }),
+    revealed: new THREE.MeshStandardMaterial({
+      color: 0xcbd4d3,
+      roughness: 0.92,
+      metalness: 0.02,
+      flatShading: true
+    }),
+    mine: new THREE.MeshStandardMaterial({
+      color: 0x6e1f25,
+      emissive: 0x3b090d,
+      roughness: 0.55,
+      metalness: 0.2
+    }),
+    exploded: new THREE.MeshStandardMaterial({
+      color: 0xd04b3e,
+      emissive: 0x66150f,
+      emissiveIntensity: 0.8,
+      roughness: 0.45
+    }),
+    seams: new THREE.LineBasicMaterial({ color: 0x0b1823, transparent: true, opacity: 0.92 })
+  }
+
+  private cells: SphereCell[] = []
+  private game!: MinesweeperGame
+  private difficulty: DifficultyId = 'dense'
+  private hoveredId: number | null = null
+  private startedAt: number | null = null
+  private elapsedBeforeFinish = 0
+  private flagMode = false
 
   constructor() {
-    // 初始化Three.js
-    this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(0x1a1a2e);
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2))
+    this.renderer.setSize(innerWidth, innerHeight)
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping
+    this.renderer.toneMappingExposure = 1.05
+    document.querySelector<HTMLDivElement>('#app')!.appendChild(this.renderer.domElement)
 
-    this.camera = new THREE.PerspectiveCamera(
-      75,
-      window.innerWidth / window.innerHeight,
-      0.1,
-      1000
-    );
+    this.scene.add(this.globe)
+    this.setupScene()
+    const controls = new CameraControls(this.globe, this.camera, this.renderer.domElement, {
+      onTap: (event) => this.handleTap(event.clientX, event.clientY),
+      onPointerMove: (event) => this.updateHover(event.clientX, event.clientY)
+    })
+    controls.reset()
 
-    this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setSize(window.innerWidth, window.innerHeight);
-    this.renderer.shadowMap.enabled = true;
-
-    const app = document.getElementById('app');
-    if (app) {
-      app.appendChild(this.renderer.domElement);
-    }
-
-    // 初始化相机控制
-    this.cameraControls = new CameraControls(this.camera, this.renderer.domElement);
-    this.cameraControls.reset();
-
-    // 初始化射线检测
-    this.raycaster = new THREE.Raycaster();
-    this.mouse = new THREE.Vector2();
-
-    // 创建场景
-    this.setupScene();
-
-    // 创建网格（足球结构：五边形+六边形）
-    // hexSize是六边形的边长（也是外接圆半径）
-    // 使用较大的值确保可见
-    this.sphereGrid = new SphereGrid(5, 1.2);
-    this.initGame();
-
-    // 设置事件监听
-    this.setupEventListeners();
-
-    // 开始渲染循环
-    this.animate();
-
-    // UI事件
-    const resetBtn = document.getElementById('reset-btn');
-    if (resetBtn) {
-      resetBtn.addEventListener('click', () => this.resetGame());
-    }
+    this.renderer.domElement.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      this.flagAt(event.clientX, event.clientY)
+    })
+    window.addEventListener('resize', this.onResize)
+    this.bindUI()
+    this.startGame()
+    this.animate()
   }
 
-  private setupScene() {
-    // 创建星空背景
-    this.createStarfield();
+  private setupScene(): void {
+    this.scene.fog = new THREE.FogExp2(0x07111b, 0.027)
+    this.scene.add(new THREE.HemisphereLight(0xbad8e8, 0x111820, 1.55))
 
-    // 创建地球球体
-    this.createEarth();
+    const keyLight = new THREE.DirectionalLight(0xffe4bc, 3.2)
+    keyLight.position.set(-5, 6, 8)
+    this.scene.add(keyLight)
 
-    // 环境光
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
-    this.scene.add(ambientLight);
+    const rimLight = new THREE.DirectionalLight(0x5ea5d1, 2.8)
+    rimLight.position.set(6, 1, -5)
+    this.scene.add(rimLight)
 
-    // 定向光（模拟太阳光）
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    directionalLight.position.set(10, 10, 5);
-    directionalLight.castShadow = true;
-    this.scene.add(directionalLight);
+    const core = new THREE.Mesh(
+      new THREE.SphereGeometry(4.91, 48, 32),
+      new THREE.MeshStandardMaterial({ color: 0x101e2a, roughness: 0.88, metalness: 0.08 })
+    )
+    core.name = 'globe-core'
+    this.globe.add(core)
 
-    // 点光源（增加一些环境亮度）
-    const pointLight = new THREE.PointLight(0xffffff, 0.3);
-    pointLight.position.set(-5, 5, -5);
-    this.scene.add(pointLight);
+    const orbit = new THREE.Mesh(
+      new THREE.TorusGeometry(5.82, 0.014, 6, 180),
+      new THREE.MeshBasicMaterial({ color: 0xd99a3c, transparent: true, opacity: 0.68 })
+    )
+    orbit.rotation.x = Math.PI * 0.56
+    orbit.rotation.y = Math.PI * 0.12
+    this.scene.add(orbit)
+
+    const secondOrbit = orbit.clone()
+    secondOrbit.scale.setScalar(1.012)
+    secondOrbit.rotation.x = Math.PI * 0.48
+    secondOrbit.rotation.y = -Math.PI * 0.15
+    ;(secondOrbit.material as THREE.Material) = (orbit.material as THREE.Material).clone()
+    ;(secondOrbit.material as THREE.MeshBasicMaterial).opacity = 0.18
+    this.scene.add(secondOrbit)
   }
 
-  private createStarfield() {
-    // 创建星空背景
-    const starsGeometry = new THREE.BufferGeometry();
-    const starsMaterial = new THREE.PointsMaterial({
-      color: 0xffffff,
-      size: 0.5,
-      transparent: true,
-      opacity: 0.8
-    });
-
-    // 生成星星位置
-    const starsVertices: number[] = [];
-    const numStars = 5000;
-
-    for (let i = 0; i < numStars; i++) {
-      // 在球面上随机分布星星
-      const theta = Math.random() * Math.PI * 2;
-      const phi = Math.acos(Math.random() * 2 - 1);
-      const radius = 500; // 很远的位置
-
-      const x = radius * Math.sin(phi) * Math.cos(theta);
-      const y = radius * Math.sin(phi) * Math.sin(theta);
-      const z = radius * Math.cos(phi);
-
-      starsVertices.push(x, y, z);
-    }
-
-    starsGeometry.setAttribute('position', new THREE.Float32BufferAttribute(starsVertices, 3));
-
-    const stars = new THREE.Points(starsGeometry, starsMaterial);
-    this.scene.add(stars);
-
-    // 设置背景色为深空色
-    this.scene.background = new THREE.Color(0x000000);
+  private bindUI(): void {
+    document
+      .querySelector<HTMLButtonElement>('#restart')!
+      .addEventListener('click', () => this.startGame())
+    document.querySelectorAll<HTMLButtonElement>('[data-difficulty]').forEach((button) => {
+      button.addEventListener('click', () => {
+        this.difficulty = button.dataset.difficulty as DifficultyId
+        this.startGame()
+      })
+    })
+    document.querySelector<HTMLButtonElement>('#flag-mode')!.addEventListener('click', () => {
+      this.setFlagMode(!this.flagMode)
+    })
   }
 
-  private createEarth() {
-    // 创建地球球体（稍微小于六边形网格，作为背景）
-    const earthRadius = 4.95; // 稍微小于六边形网格的半径5
-    const earthGeometry = new THREE.SphereGeometry(earthRadius, 64, 64);
-
-    const textureLoader = new THREE.TextureLoader();
-
-    // 使用真实的地球纹理
-    // 使用公开的地球纹理资源
-    const earthTexture = textureLoader.load(
-      'https://threejs.org/examples/textures/planets/earth_atmos_2048.jpg',
-      (texture) => {
-        console.log('地球纹理加载成功');
-        texture.wrapS = THREE.RepeatWrapping;
-        texture.wrapT = THREE.RepeatWrapping;
-      },
-      undefined,
-      (error) => {
-        console.warn('地球纹理加载失败，使用默认颜色:', error);
-      }
-    );
-
-    // 加载地球法线贴图（可选）
-    const normalTexture = textureLoader.load(
-      'https://threejs.org/examples/textures/planets/earth_normal_2048.jpg',
-      (texture) => {
-        texture.wrapS = THREE.RepeatWrapping;
-        texture.wrapT = THREE.RepeatWrapping;
-      },
-      undefined,
-      () => {
-        // 加载失败不影响显示
-      }
-    );
-
-    // 加载地球镜面贴图（可选）
-    const specularTexture = textureLoader.load(
-      'https://threejs.org/examples/textures/planets/earth_specular_2048.jpg',
-      (texture) => {
-        texture.wrapS = THREE.RepeatWrapping;
-        texture.wrapT = THREE.RepeatWrapping;
-      },
-      undefined,
-      () => {
-        // 加载失败不影响显示
-      }
-    );
-
-    // 创建地球材质
-    const earthMaterial = new THREE.MeshPhongMaterial({
-      map: earthTexture,
-      normalMap: normalTexture,
-      specularMap: specularTexture,
-      specular: new THREE.Color(0x333333),
-      shininess: 25,
-      transparent: true,
-      opacity: 0.95
-    });
-
-    const earth = new THREE.Mesh(earthGeometry, earthMaterial);
-    earth.renderOrder = 0; // 在地球球体之前渲染
-    this.scene.add(earth);
-
-    // 添加大气层效果
-    const atmosphereGeometry = new THREE.SphereGeometry(earthRadius * 1.02, 64, 64);
-    const atmosphereMaterial = new THREE.MeshBasicMaterial({
-      color: 0x88ccff,
-      transparent: true,
-      opacity: 0.15,
-      side: THREE.BackSide
-    });
-    const atmosphere = new THREE.Mesh(atmosphereGeometry, atmosphereMaterial);
-    this.scene.add(atmosphere);
-  }
-
-  private initGame() {
-    // 清除旧的网格
-    if (this.hexGroup) {
-      this.scene.remove(this.hexGroup);
-      this.hexGroup.traverse((child) => {
-        if (child instanceof THREE.Mesh) {
-          child.geometry.dispose();
-          if (Array.isArray(child.material)) {
-            child.material.forEach(mat => mat.dispose());
-          } else {
-            child.material.dispose();
-          }
-        }
-      });
-    }
-
-    // 生成新网格
-    this.hexGroup = this.sphereGrid.generateGrid();
-    
-    // 确保多边形在地球之后渲染（渲染顺序）
-    this.hexGroup.renderOrder = 1;
-    this.scene.add(this.hexGroup);
-    
-    console.log('多边形组已添加到场景，子对象数量:', this.hexGroup.children.length);
-
-    // 创建游戏逻辑
-    const gridKeys = Array.from(this.sphereGrid.getHexagons().keys());
-    const totalCells = gridKeys.length;
-    const mineCount = Math.floor(totalCells * 0.15); // 15%的地雷率
-
+  private startGame(): void {
+    this.clearCells()
+    const config = DIFFICULTY_BY_ID.get(this.difficulty)!
+    this.cells = SphereGrid.generate(config.detail, 5)
+    const neighborMap = new Map(this.cells.map((cell) => [cell.id, cell.neighborIds]))
     this.game = new MinesweeperGame(
-      gridKeys,
-      mineCount,
-      (coord) => this.sphereGrid.getKey(coord),
-      (coord) => this.sphereGrid.getNeighbors(coord)
-    );
+      this.cells.map((cell) => cell.id),
+      neighborMap,
+      config.mines
+    )
+    this.startedAt = null
+    this.elapsedBeforeFinish = 0
+    this.setFlagMode(false)
+    this.hoveredId = null
+    this.globe.quaternion.identity()
 
-    // 初始化所有六边形的材质
-    this.updateAllHexMaterials();
+    for (const cell of this.cells) {
+      const geometry = this.createCellGeometry(cell)
+      const mesh = new THREE.Mesh(geometry, this.materials.hidden)
+      mesh.userData.cellId = cell.id
+      mesh.userData.isCell = true
+      this.cellMeshes.set(cell.id, mesh)
+      this.globe.add(mesh)
 
-    // 更新UI
-    this.updateUI();
-  }
+      const seamGeometry = new THREE.BufferGeometry().setFromPoints([
+        ...geometry.userData.edgePoints,
+        geometry.userData.edgePoints[0]
+      ])
+      const seam = new THREE.Line(seamGeometry, this.materials.seams)
+      seam.userData.isDecoration = true
+      this.globe.add(seam)
 
-  private setupEventListeners() {
-    // 窗口大小调整
-    window.addEventListener('resize', () => {
-      this.camera.aspect = window.innerWidth / window.innerHeight;
-      this.camera.updateProjectionMatrix();
-      this.renderer.setSize(window.innerWidth, window.innerHeight);
-    });
-
-    // 鼠标点击
-    this.renderer.domElement.addEventListener('click', (e) => this.onMouseClick(e));
-    this.renderer.domElement.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      this.onRightClick(e);
-    });
-  }
-
-  private onMouseClick(event: MouseEvent) {
-    if (!this.game || !this.hexGroup) return;
-
-    // 更新鼠标位置
-    this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-    this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-
-    // 射线检测
-    this.raycaster.setFromCamera(this.mouse, this.camera);
-    const intersects = this.raycaster.intersectObjects(this.hexGroup.children, true);
-
-    if (intersects.length > 0) {
-      const hex = intersects[0].object as THREE.Mesh;
-      const hexKey = (hex.userData as any).hexKey;
-      if (hexKey) {
-        const changed = this.game.revealCell(hexKey);
-        if (changed) {
-          this.updateHexMaterial(hexKey);
-          this.updateUI();
-        }
-      }
+      const marker = this.createMarker(cell, '', '#ffffff', config.labelScale)
+      marker.visible = false
+      this.markers.set(cell.id, marker)
+      this.globe.add(marker)
     }
+
+    document.querySelectorAll<HTMLButtonElement>('[data-difficulty]').forEach((button) => {
+      const selected = button.dataset.difficulty === this.difficulty
+      button.classList.toggle('selected', selected)
+      button.setAttribute('aria-pressed', String(selected))
+    })
+    this.hideResult()
+    this.updateUI()
   }
 
-  private onRightClick(event: MouseEvent) {
-    if (!this.game || !this.hexGroup) return;
-
-    this.mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
-    this.mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
-
-    this.raycaster.setFromCamera(this.mouse, this.camera);
-    const intersects = this.raycaster.intersectObjects(this.hexGroup.children, true);
-
-    if (intersects.length > 0) {
-      const hex = intersects[0].object as THREE.Mesh;
-      const hexKey = (hex.userData as any).hexKey;
-      if (hexKey) {
-        const changed = this.game.toggleFlag(hexKey);
-        if (changed) {
-          this.updateHexMaterial(hexKey);
-          this.updateUI();
-        }
-      }
+  private createCellGeometry(cell: SphereCell): THREE.BufferGeometry {
+    const centerDirection = cell.center.clone().normalize()
+    const edgePoints = cell.boundary.map((boundary) =>
+      centerDirection
+        .clone()
+        .lerp(boundary.clone().normalize(), 0.9)
+        .normalize()
+        .multiplyScalar(5.015)
+    )
+    const positions: number[] = [...cell.center.clone().setLength(5.015).toArray()]
+    edgePoints.forEach((point) => positions.push(...point.toArray()))
+    const indices: number[] = []
+    for (let index = 0; index < edgePoints.length; index++) {
+      indices.push(0, index + 1, ((index + 1) % edgePoints.length) + 1)
     }
+
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.setIndex(indices)
+    geometry.computeVertexNormals()
+    geometry.userData.edgePoints = edgePoints
+    return geometry
   }
 
-  private updateHexMaterial(hexKey: string) {
-    if (!this.game || !this.hexGroup) return;
+  private createMarker(cell: SphereCell, text: string, color: string, scale: number): THREE.Sprite {
+    const canvas = document.createElement('canvas')
+    canvas.width = 128
+    canvas.height = 128
+    const context = canvas.getContext('2d')!
+    context.clearRect(0, 0, 128, 128)
+    context.textAlign = 'center'
+    context.textBaseline = 'middle'
+    context.fillStyle = color
+    context.shadowColor = 'rgba(0,0,0,.22)'
+    context.shadowBlur = 4
+    if (text === '⚑') {
+      context.lineWidth = 9
+      context.lineCap = 'round'
+      context.strokeStyle = color
+      context.beginPath()
+      context.moveTo(43, 102)
+      context.lineTo(43, 27)
+      context.stroke()
+      context.shadowBlur = 7
+      context.beginPath()
+      context.moveTo(48, 30)
+      context.lineTo(97, 45)
+      context.lineTo(48, 65)
+      context.closePath()
+      context.fill()
+      context.beginPath()
+      context.ellipse(48, 105, 29, 8, 0, 0, Math.PI * 2)
+      context.fill()
+    } else if (text === '✹') {
+      context.font = '700 82px Inter, Arial, sans-serif'
+      context.fillText('✹', 64, 68)
+    } else {
+      context.font = '700 76px Inter, Arial, sans-serif'
+      context.fillText(text, 64, 68)
+    }
 
-    const hex = this.sphereGrid.getHexagons().get(hexKey);
-    if (!hex) return;
+    const texture = new THREE.CanvasTexture(canvas)
+    texture.colorSpace = THREE.SRGBColorSpace
+    const marker = new THREE.Sprite(
+      new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: true })
+    )
+    marker.position.copy(cell.center).setLength(5.09)
+    marker.scale.setScalar(scale)
+    marker.userData.currentText = text
+    marker.userData.hasContent = Boolean(text)
+    return marker
+  }
 
-    const cell = this.game.getCell(hexKey);
-    if (!cell) return;
+  private setMarker(id: number, text: string, color: string): void {
+    const oldMarker = this.markers.get(id)!
+    if (oldMarker.userData.currentText === `${text}:${color}`) {
+      oldMarker.visible = Boolean(text)
+      return
+    }
+    const cell = this.cells[id]
+    const scale = DIFFICULTY_BY_ID.get(this.difficulty)!.labelScale
+    const replacement = this.createMarker(cell, text, color, scale)
+    replacement.userData.currentText = `${text}:${color}`
+    replacement.userData.hasContent = Boolean(text)
+    replacement.visible = Boolean(text)
+    this.globe.add(replacement)
+    this.globe.remove(oldMarker)
+    ;(oldMarker.material as THREE.SpriteMaterial).map?.dispose()
+    oldMarker.material.dispose()
+    this.markers.set(id, replacement)
+  }
 
-    let material: THREE.MeshStandardMaterial;
+  private revealAt(clientX: number, clientY: number): void {
+    const id = this.pickCell(clientX, clientY)
+    if (id === null) return
+    const before = this.game.status
+    const result = this.game.reveal(id)
+    if (before === GameStatus.READY && this.game.status === GameStatus.PLAYING)
+      this.startedAt = performance.now()
+    this.applyResult(result)
+  }
+
+  private handleTap(clientX: number, clientY: number): void {
+    if (this.flagMode) this.flagAt(clientX, clientY)
+    else this.revealAt(clientX, clientY)
+  }
+
+  private setFlagMode(enabled: boolean): void {
+    this.flagMode = enabled
+    const button = document.querySelector<HTMLButtonElement>('#flag-mode')
+    if (!button) return
+    button.classList.toggle('selected', enabled)
+    button.setAttribute('aria-pressed', String(enabled))
+  }
+
+  private flagAt(clientX: number, clientY: number): void {
+    const id = this.pickCell(clientX, clientY)
+    if (id === null) return
+    this.applyResult(this.game.toggleFlag(id))
+  }
+
+  private applyResult(result: GameActionResult): void {
+    for (const id of result.changedIds) this.updateCell(id)
+    if (result.status === GameStatus.WON || result.status === GameStatus.LOST) {
+      if (this.startedAt !== null) this.elapsedBeforeFinish = performance.now() - this.startedAt
+      this.showResult(result.status)
+    }
+    this.updateUI()
+  }
+
+  private updateCell(id: number): void {
+    const cell = this.game.getCell(id)!
+    const mesh = this.cellMeshes.get(id)!
+    mesh.scale.setScalar(1)
 
     if (cell.state === CellState.HIDDEN) {
-      material = new THREE.MeshStandardMaterial({
-        color: 0x444488,
-        metalness: 0.3,
-        roughness: 0.7,
-        side: THREE.DoubleSide // 双面渲染
-      });
+      mesh.material = this.materials.hidden
+      this.setMarker(id, '', '#fff')
     } else if (cell.state === CellState.FLAGGED) {
-      material = new THREE.MeshStandardMaterial({
-        color: 0xff0000,
-        metalness: 0.5,
-        roughness: 0.5,
-        side: THREE.DoubleSide
-      });
+      mesh.material = this.materials.hidden
+      mesh.scale.setScalar(1.012)
+      this.setMarker(id, '⚑', '#f6ad3c')
     } else if (cell.state === CellState.EXPLODED) {
-      material = new THREE.MeshStandardMaterial({
-        color: 0xff0000,
-        emissive: 0xff0000,
-        emissiveIntensity: 0.5,
-        side: THREE.DoubleSide
-      });
+      mesh.material = this.materials.exploded
+      this.setMarker(id, '✹', '#fff1de')
     } else if (cell.isMine) {
-      material = new THREE.MeshStandardMaterial({
-        color: 0xff0000,
-        emissive: 0xff0000,
-        emissiveIntensity: 0.3,
-        side: THREE.DoubleSide
-      });
+      mesh.material = this.materials.mine
+      this.setMarker(id, '✹', '#ffd8bd')
     } else {
-      // 根据周围地雷数显示不同颜色
-      const colors = [
-        0xffffff, // 0
-        0x0000ff, // 1
-        0x008000, // 2
-        0xff0000, // 3
-        0x800080, // 4
-        0x800000, // 5
-        0x008080, // 6
-      ];
-      const color = colors[Math.min(cell.adjacentMines, colors.length - 1)] || 0xffffff;
-      material = new THREE.MeshStandardMaterial({
-        color: color,
-        metalness: 0.1,
-        roughness: 0.9,
-        side: THREE.DoubleSide
-      });
-    }
-
-    hex.material = material;
-
-    // 如果需要显示数字，可以在这里添加文本
-  }
-
-  private updateAllHexMaterials() {
-    if (!this.game) return;
-
-    for (const [key] of this.game.getAllCells()) {
-      this.updateHexMaterial(key);
+      mesh.material = this.materials.revealed
+      mesh.scale.setScalar(0.993)
+      const value = cell.adjacentMines
+      this.setMarker(
+        id,
+        value > 0 ? String(value) : '',
+        NUMBER_COLORS[Math.min(value, NUMBER_COLORS.length - 1)]
+      )
     }
   }
 
-  private updateUI() {
-    if (!this.game) return;
-
-    const mineCountEl = document.getElementById('mine-count');
-    const flaggedCountEl = document.getElementById('flagged-count');
-    const statusEl = document.getElementById('game-status');
-
-    if (mineCountEl) {
-      const totalMines = Array.from(this.game.getAllCells().values()).filter(c => c.isMine).length;
-      mineCountEl.textContent = totalMines.toString();
+  private updateHover(clientX: number, clientY: number): void {
+    const id = this.pickCell(clientX, clientY)
+    if (id === this.hoveredId) return
+    if (this.hoveredId !== null) this.updateCell(this.hoveredId)
+    this.hoveredId = id
+    if (id !== null) {
+      const mesh = this.cellMeshes.get(id)!
+      if (this.game.getCell(id)?.state === CellState.HIDDEN) mesh.scale.setScalar(1.018)
     }
-
-    if (flaggedCountEl) {
-      flaggedCountEl.textContent = this.game.getFlaggedCount().toString();
-    }
-
-    if (statusEl) {
-      if (this.game.isGameWon()) {
-        statusEl.textContent = '胜利！';
-        statusEl.style.color = '#4CAF50';
-      } else if (this.game.isGameOver()) {
-        statusEl.textContent = '游戏结束';
-        statusEl.style.color = '#f44336';
-      } else {
-        statusEl.textContent = '游戏中';
-        statusEl.style.color = '#ffffff';
-      }
-    }
+    this.renderer.domElement.style.cursor = id === null ? 'grab' : 'pointer'
   }
 
-  private resetGame() {
-    this.initGame();
+  private pickCell(clientX: number, clientY: number): number | null {
+    const bounds = this.renderer.domElement.getBoundingClientRect()
+    this.pointer.set(
+      ((clientX - bounds.left) / bounds.width) * 2 - 1,
+      -((clientY - bounds.top) / bounds.height) * 2 + 1
+    )
+    this.raycaster.setFromCamera(this.pointer, this.camera)
+    const intersections = this.raycaster.intersectObjects(
+      Array.from(this.cellMeshes.values()),
+      false
+    )
+    return intersections.length > 0 ? (intersections[0].object.userData.cellId as number) : null
   }
 
-  private animate() {
-    requestAnimationFrame(() => this.animate());
-    
-    // 确保多边形在地球之上渲染
-    this.renderer.render(this.scene, this.camera);
+  private updateUI(): void {
+    document.querySelector('#mine-count')!.textContent = String(this.game.totalMines).padStart(
+      3,
+      '0'
+    )
+    document.querySelector('#flag-count')!.textContent = String(this.game.flagsRemaining).padStart(
+      3,
+      '0'
+    )
+    const status = document.querySelector('#game-status')!
+    status.textContent = {
+      [GameStatus.READY]: 'Awaiting first scan',
+      [GameStatus.PLAYING]: 'Survey active',
+      [GameStatus.WON]: 'Sector cleared',
+      [GameStatus.LOST]: 'Mine triggered'
+    }[this.game.status]
+    status.setAttribute('data-status', this.game.status)
+  }
+
+  private showResult(status: GameStatus): void {
+    const result = document.querySelector<HTMLDivElement>('#result')!
+    result.classList.add('visible')
+    result.classList.toggle('failure', status === GameStatus.LOST)
+    result.querySelector('strong')!.textContent =
+      status === GameStatus.WON ? 'Sector cleared' : 'Survey failed'
+    result.querySelector('span')!.textContent =
+      status === GameStatus.WON
+        ? 'All safe cells verified.'
+        : 'A mine was triggered. Recalibrate and try again.'
+  }
+
+  private hideResult(): void {
+    document.querySelector('#result')?.classList.remove('visible', 'failure')
+  }
+
+  private clearCells(): void {
+    for (const mesh of this.cellMeshes.values()) {
+      this.globe.remove(mesh)
+      mesh.geometry.dispose()
+    }
+    for (const marker of this.markers.values()) {
+      this.globe.remove(marker)
+      ;(marker.material as THREE.SpriteMaterial).map?.dispose()
+      marker.material.dispose()
+    }
+    const decorations = this.globe.children.filter((child) => child.userData.isDecoration)
+    for (const decoration of decorations) {
+      this.globe.remove(decoration)
+      if (decoration instanceof THREE.Line) decoration.geometry.dispose()
+    }
+    this.cellMeshes.clear()
+    this.markers.clear()
+  }
+
+  private readonly onResize = (): void => {
+    this.camera.aspect = innerWidth / innerHeight
+    this.camera.updateProjectionMatrix()
+    this.renderer.setSize(innerWidth, innerHeight)
+  }
+
+  private animate = (): void => {
+    requestAnimationFrame(this.animate)
+    if (this.game?.status === GameStatus.PLAYING && this.startedAt !== null) {
+      this.renderTime(performance.now() - this.startedAt)
+    } else {
+      this.renderTime(this.elapsedBeforeFinish)
+    }
+    const worldPosition = new THREE.Vector3()
+    const worldNormal = new THREE.Vector3()
+    for (const marker of this.markers.values()) {
+      marker.getWorldPosition(worldPosition)
+      worldNormal.copy(marker.position).normalize().applyQuaternion(this.globe.quaternion)
+      const facing = worldNormal.dot(this.camera.position.clone().sub(worldPosition).normalize())
+      marker.visible = Boolean(marker.userData.hasContent) && facing > 0.35
+    }
+    this.renderer.render(this.scene, this.camera)
+  }
+
+  private renderTime(milliseconds: number): void {
+    const seconds = Math.floor(milliseconds / 1000)
+    const minutes = Math.floor(seconds / 60)
+    document.querySelector('#timer')!.textContent =
+      `${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
   }
 }
 
-// 启动应用
-new GameApp();
-
+new OrbitalSweepApp()
